@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# Environment Specific Variables can be left blank if passing parameters from jamf
+# hardcode here for testing
+
+api_user='xxx'
+api_pass='xxxxxx'
+jamf_url='https://xxx.jamfcloud.com'
+# A Jamf Pro computer group (static or smart) that contains the client for which you want a report
+group_name='xxxx'
+# Number of days in the report (using today as the end date...)
+days=180
+
+# Check for passed parameters from jamf
+if [ "$4" != "" ]; then
+	api_user=$4
+fi
+
+if [ "$5" != "" ]; then
+	api_pass=$5
+fi
+
+if [ "$6" != "" ]; then
+	jamf_url=$6
+fi
+
+if [ "$7" != "" ]; then
+	group_name=$7
+fi
+
+if [ "$8" != "" ]; then
+	days=$8
+fi
+
+# Location of jamfHelper
+jamfHelper="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+
+# For testing only if you have a test JSS with a self signed SSL cert...
+# Set security='' for normal use. Set security='--insecure' for testing
+security=''
+#security='--insecure'
+
+# URL encode function
+urlencode() {
+	old_lc_collate=$LC_COLLATE
+	LC_COLLATE=C
+	local length="${#1}"
+	for (( i = 0; i < length; i++ )); do
+		local c="${1:i:1}"
+		case $c in
+			[a-zA-Z0-9.~_-]) printf "$c" ;;
+			*) printf '%%%02X' "'$c" ;;
+		esac
+	done
+	LC_COLLATE=$old_lc_collate
+}
+
+# URL encode the group name
+group_name=$( urlencode "$group_name" )
+
+# Pretty file name
+filename="Application Usage Report - $days day "
+
+# Today's date minus the days
+start_date=$(date -j -v-${days}d +"%Y"-"%m"-"%d")
+
+# Today's date
+end_date=$(date +"%Y-%m-%d")
+
+# Timestamp for filename
+timestamp=$(date +"%Y-%m-%d-%H%M%S")
+
+# Getting the Bearer token
+jamfTokenCurl=$(curl -s -u "$api_user:$api_pass" "$jamf_url/api/v1/auth/token" -X POST)
+jamfBearerToken=$(echo "$jamfTokenCurl" | jq -r .token)
+
+
+
+
+# If you want, this dialog box will let the user know what's about to happen
+buttonClicked=$("$jamfHelper" \
+		-windowType utility \
+		-title "Application Usage Report" \
+		-heading "Please click OK to build the report." \
+		-description "This process may take a few minutes depending on how many computers are in the report. We'll let you know when we're finished." \
+		-button1 "Okay" \
+		-defaultButton 1 \
+		-icon "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertNoteIcon.icns")
+
+# Build the API path to the smartgroup
+api_path="JSSResource/computergroups/name/${group_name}"
+
+# Get the currently logged in user for the output file path
+loggedInUser=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ { print $3 }')
+loggedInUserHome=$(dscl . read /Users/$loggedInUser NFSHomeDirectory | cut -d' ' -f2-)
+
+# Getting Serial Numbers
+echo "Getting a list of devices in Jamf Pro group. "
+URL="${jamf_url}/${api_path}"
+responseXML=$(curl ${security} --silent --show-error --write-out "\n%{http_code}" \
+							--header "Authorization: Bearer ${jamfBearerToken}" \
+							--header "Accept: text/xml" "${URL}")
+HTTP_Status=$(echo "$responseXML" | tail -1)
+responseXML=$(echo "$responseXML" | sed \$d)
+
+echo "HTTP_Status : $HTTP_Status"
+/bin/echo -n "HTTP Status Code: $HTTP_Status : "
+if [[ $HTTP_Status = "200" ]]; then
+	echo '[OK]'
+elif [[ $HTTP_Status = "400" ]]; then
+	echo "[error] Invalid API request"
+	exit 1
+else
+	echo "[error] API could not return the group information. "
+	echo "$responseXML"
+	exit 1
+fi
+
+serialnumbers=($(echo "$responseXML" | xsltproc /tmp/stylesheet.xslt -))
+
+echo "Serial number list : ${serialnumbers[@]}"
+device_count=${#serialnumbers[@]}
+touch /tmp/export.csv
+
+# Write the header values of each column
+echo "Full Name,Username,Position,Department,Building,Room,Email Address,Model,Serial Number,App Name,Version Number,Minutes in Forground,Minutes Open" > /tmp/export.csv
+
+for serial in "${serialnumbers[@]}"; do
+	echo "Requesting details for device serial number : ${serial}"
+	api_device_path="JSSResource/computers/serialnumber/$serial"
+	location_data=$(curl ${security} --silent --show-error \
+									--header "Authorization: Bearer ${jamfBearerToken}" \
+									--header "Accept: text/xml" "$jamf_url/$api_device_path")
+	username=$(echo $location_data | /usr/bin/awk -F'<username>|</username>' '{print $2}')
+	realname=$(echo $location_data | /usr/bin/awk -F'<realname>|</realname>' '{print $2}')
+	email_address=$(echo $location_data | /usr/bin/awk -F'<email_address>|</email_address>' '{print $2}')
+	position=$(echo $location_data | /usr/bin/awk -F'<position>|</position>' '{print $2}')
+	department=$(echo $location_data | /usr/bin/awk -F'<department>|</department>' '{print $2}')
+	room=$(echo $location_data | /usr/bin/awk -F'<room>|</room>' '{print $2}')
+	building=$(echo $location_data | /usr/bin/awk -F'<building>|</building>' '{print $2}')
+	model=$(echo $location_data | /usr/bin/awk -F'<model>|</model>' '{print $2}')
+
+	echo "\$username      : \"${username}\""
+	echo "\$realname      : \"${realname}\""
+	echo "\$email_address : \"${email_address}\""
+	echo "\$position      : \"${position}\""
+	echo "\$department    : \"${department}\""
+	echo "\$room          : \"${room}\""
+	echo "\$building      : \"${building}\""
+	echo "\$model         : \"${model}\""
+
+	api_path="JSSResource/computerapplicationusage/serialnumber/$serial/${start_date}_${end_date}"
+	xmlResponse=$(curl ${security} --silent --show-error \
+								--header "Authorization: Bearer ${jamfBearerToken}" \
+								--header "Accept: text/xml" "$jamf_url/$api_path")
+
+	cat << EOF > /tmp/stylesheet.xslt
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+		<xsl:output method="text"/>
+		<xsl:template match="/">
+				<xsl:for-each select="computer_application_usage/usage/apps/app">
+						<xsl:text>${realname//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${username//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${position//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${department//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${room//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${building//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${email_address//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>${model//,}</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:text>$serial</xsl:text>
+						<xsl:text>,</xsl:text>
+						<xsl:value-of select="name"/>
+						<xsl:text>,</xsl:text>
+						<xsl:value-of select="version"/>
+						<xsl:text>,</xsl:text>
+						<xsl:value-of select="foreground"/>
+						<xsl:text>,</xsl:text>
+						<xsl:value-of select="open"/>
+						<xsl:text>
+						</xsl:text>
+				</xsl:for-each>
+		</xsl:template>
+</xsl:stylesheet>
+EOF
+
+	usageData=$(echo "$xmlResponse" | xsltproc /tmp/stylesheet.xslt -)
+	if [[ -z "$usageData" ]]; then
+		echo "No application usage data found for serial number ${serial}."
+	else
+		echo "$usageData" >> /tmp/export.csv
+	fi
+done
+
+# Output file path
+outputFilePath="${loggedInUserHome}/Desktop/${filename} - ${timestamp}.csv"
+
+# Move the file to the user's desktop
+mv /tmp/export.csv "$outputFilePath"
+
+# Notify the user that the report is complete
+"$jamfHelper" \
+	-windowType utility \
+	-title "Application Usage Report" \
+	-heading "Report Complete" \
+	-description "The application usage report has been saved to your Desktop." \
+	-button1 "OK" \
+	-defaultButton 1 \
+	-icon "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertNoteIcon.icns"
+
+# Invalidate the Bearer token
+curl -s -H "Authorization: Bearer ${jamfBearerToken}" -X POST "${jamf_url}/api/v1/auth/invalidate-token"
+
+echo "Done! Check ${outputFilePath} for the report."
